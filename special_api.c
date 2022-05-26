@@ -24,10 +24,11 @@ int display_callback_function (pid_t tid, struct breakpoint_info_ *bp, struct us
 
     param1 = regs->rdi&0x7fffffffffffffff;
     if (bp->is_return ||
-        strncmp(bp->func_name, "__be_insert_slowest_cmd", strlen("__be_insert_slowest_cmd"))) {
+        strncmp(bp->func_name, "your_speical_api", strlen("your_special_api"))) {
         return -1;
     }
 
+    /* Assume your API's parameter is callback function pointer, we want to convert it back to API name */
     callback = addr_to_api_name(tid, param1);
     printf("Callback : %s\n", callback?callback:"NULL");
     return 0;
