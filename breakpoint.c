@@ -23,9 +23,9 @@
 #include "breakpoint.h"
 #include "func_addr.h"
 #include "spy.h"
-#include "arch.h"
 #include "log.h"
 
+static uint8_t break_instr[] = {0xcc};
 static bool exit_flag;
 static int debug_bp_verbose;
 /* global unique address: process id + virtual address */
@@ -235,7 +235,6 @@ void print_callinfo (struct traced_process_ *proc, struct breakpoint_info_ *acti
     output_message("[%d]%*s%s%s\n", depth + j, depth*4, " ", is_return?"    <-":"->", &active_bp->func_name[i]);
 }
 
-#ifndef __arm__
 void run_shadow_api (int pid, long shadow_abs_addr, struct user_regs_struct *regs)
 {
     struct user_regs_struct orig_code_regs;
@@ -270,18 +269,14 @@ bailout:
     /* TODO error handling & cleanup */
     return;
 }
-#endif
 
 int insert_breakpoint_for_return (struct breakpoint_info_ *func_bp,
                                   pid_t tid, struct user_regs_struct *regs)
 {
     long return_addr, data;
     struct breakpoint_info_* ret_bp;
-#ifdef __arm__
-    return_addr = ptrace(PTRACE_PEEKTEXT, tid, regs->sp, 0);
-#else
+
     return_addr = ptrace(PTRACE_PEEKTEXT, tid, regs->rsp, 0);
-#endif
     ret_bp = get_breakpoint_via_addr(tid, return_addr);
     if (ret_bp) {
         /* already tracked */
@@ -321,13 +316,9 @@ int step_over_lwp (struct traced_process_ *proc, pid_t tid)
     long trace_ip[MAX_DEPTH], addr;
     struct breakpoint_info_* bp;
     struct user_regs_struct regs;
-#ifdef __arm__
-    ptrace(PTRACE_GETREGSET, tid, NULL, &regs);
-    addr = regs.pc - sizeof(break_instr);
-#else
+
     ptrace(PTRACE_GETREGS, tid, NULL, &regs);
     addr = regs.rip - sizeof(break_instr);
-#endif
     bp = get_breakpoint_via_addr (proc->tgid, addr);
     if (!bp) {
         /* This can be a watch triggered trap */
@@ -350,13 +341,9 @@ int step_over_lwp (struct traced_process_ *proc, pid_t tid)
         printf("Fail to restore code\n");
         return -1;
     }
-#ifdef __arm__
-    regs.pc = addr;
-    if (ptrace(PTRACE_SETREGSET, tid, NULL, &regs)) {
-#else
+
     regs.rip = addr;
     if (ptrace(PTRACE_SETREGS, tid, NULL, &regs)) {
-#endif
         printf("Fail to set args\n");
         return -1;
     }
@@ -368,12 +355,7 @@ int step_over_lwp (struct traced_process_ *proc, pid_t tid)
     if (bp->debug_flag & SHOW_FLOW) {
         long return_addr;
 
-        printf("Monitor API %s\n", bp->func_name);
-#ifdef __arm__
-        return_addr = ptrace(PTRACE_PEEKTEXT, tid, regs.sp, 0);
-#else
         return_addr = ptrace(PTRACE_PEEKTEXT, tid, regs.rsp, 0);
-#endif
         examine_api(tid, return_addr,
                     bp->sys_addr.addr,
                     bp->sys_addr.addr + bp->sys_addr.addr + bp->func_size);

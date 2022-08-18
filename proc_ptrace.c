@@ -22,17 +22,9 @@
 #include <dirent.h>
 #include <uthash.h>
 
-#ifdef __x86_64__
 static uint8_t break_instr[] = {0xcc};
 #define SZ 8
 #define PC 16
-#endif
-
-#ifdef __arm__
-static uint8_t break_instr[] = {0xf0, 0x01, 0xf0, 0xe7};
-#define SZ 4
-#define PC 15
-#endif
 
 static int debug_process;
 static struct traced_process_ *proc_ary;
@@ -438,20 +430,12 @@ long examine_api (pid_t pid, long return_addr, long addr_start, long addr_end)
             step_over = false;
         }
         wait (&status);
-#ifdef __arm__
-        ptrace (PTRACE_GETREGSET, pid, NULL, &pt_reg);
-        eip = pt_reg.pc;
-#else
+
         ptrace (PTRACE_GETREGS, pid, NULL, &pt_reg);
         eip = pt_reg.rip;
-#endif
         if (eip == return_addr) {
             printf("----- Exit Function(%lx) ----------\n", addr_start);
-#ifdef __arm__
-            return pt_reg.regs[0];
-#else
             return pt_reg.rax;
-#endif
         }
         ptrace_getdata(pid, eip, buf, sizeof(buf));
         if (buf[0] == 0xcc) {

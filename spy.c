@@ -30,7 +30,7 @@ void sigint_handler(int num)
 void show_usage (char *app)
 {
     printf("This tool support following functions:\n");
-    printf("    -p target process id, by default, it is IOSd\n");
+    printf("    -p target process id\n");
     printf("    -b additional breakpoint file\n");
     printf("    -c input function description file\n");
     printf("    -g generate function description\n");
