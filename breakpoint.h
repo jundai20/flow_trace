@@ -1,6 +1,7 @@
 #ifndef BREAKPOINT_H
 #define BREAKPOINT_H
 
+#include <stdio.h>
 #include <uthash.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -13,10 +14,12 @@
 
 #define SHOW_FUNC_NAME 1
 #define SHOW_BACKTRACE 2
-#define SHOW_FLOW 4
+#define BREAK_ON_RETURN 4
+#define MAX_INFO_LEN 128
+
 /*
- * host_file: The path show in /proc/<pid>/maps
- * host_offset: The offset in the library
+ * so_name: The path show in /proc/<pid>/maps
+ * api_offset: The offset in the library
  *
  * Example:
  *   readelf -s ./victim | grep foo --> 0x1258
@@ -24,10 +27,10 @@
  * When execute foo in victim, expect run foo in libmax.so first
  *
  * breakpoints:
- *  - host_file: /home/lnx/mycode/infect/victim
- *    host_offset: 0x1258
- *    func_name: foo
- *  - host_file: ...
+ *  - so_name: /home/lnx/mycode/infect/victim
+ *    api_offset: 0x1258
+ *    api_name: foo
+ *  - so_name: ...
  *    ...
  *
  */
@@ -38,19 +41,18 @@ struct addr_key_ {
 } __attribute__((packed));
 
 typedef struct breakpoint_info_ {
-    /* func_name for display purpose, also used as key */
-    char *func_name;
+    /* api_name for display purpose, also used as key */
+    char *api_name;
     struct addr_key_ sys_addr;
 
-    int func_size;
     long orig_code;
     /* If this is return, it is dynamic, should be removed automatically when hitten */
     bool is_return;
     int debug_flag;
 
-    /* host_file is so libaray, if not specified, it is self */
-    char *host_file;
-    long host_offset;
+    /* so_name is so libaray, if not specified, it is self */
+    char *so_name;
+    long api_offset;
 
     UT_hash_handle sys_addr_hdl;
     UT_hash_handle api_name_hdl;
@@ -72,10 +74,10 @@ struct breakpoint_info_* get_breakpoint_via_addr (pid_t pid, long addr);
 int enable_breakpoint_via_name (char *name);
 int request_pending_breakpoint (char *name, int flag);
 void disable_all_breakpoints (pid_t target_pid);
-void load_breakpoint_set (pid_t pid, const char *bp_fn);
 int remote_backtrace (struct traced_process_ *proc, int tid, long trace_ip[MAX_DEPTH]);
 void breakpoint_exit_loop (void);
-
+int load_active_breakpoints (FILE *bfp, pid_t pid);
+void load_api_addr_info (FILE *fp, pid_t pid);
 typedef int (*api_callback_fn)(pid_t tid, struct breakpoint_info_ *bp,
                                struct user_regs_struct *regs);
 int regist_api_hook (api_callback_fn fn);

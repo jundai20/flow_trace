@@ -626,11 +626,25 @@ int get_api_addr (pid_t pid, const char *api_name, long *addr_start, long* addr_
     return 0;
 }
 
+const char *noice_prefix[] = {
+     "_",
+    "register_tm_clones",
+    "deregister_tm_clones",
+    "frame_dummy",
+    "completed"
+};
+
+const char *noice_lib[] = {
+    "libc-",
+    "ld-"
+};
+
 void generate_func_description (pid_t pid, char *cfg_file)
 {
     struct proc_addr_info_ *proc;
     struct api_addr_info_ *api, *tmp;
     FILE *fp;
+    int i;
 
     read_application_symbols(pid);
     proc = get_proc_addrinfo(pid);
@@ -641,14 +655,27 @@ void generate_func_description (pid_t pid, char *cfg_file)
         printf("Error: can not open %s for write\n", cfg_file);
         return;
     }
-
-    fprintf(fp, "breakpoints:\n");
     HASH_ITER(hh, proc->api_set, api, tmp) {
-        fprintf(fp, " - host_offset: %lx\n", api->offset);
-        fprintf(fp, "   func_name: %s\n", api->func_name);
-        fprintf(fp, "   func_size: %lx\n", api->addr_end - api->addr_start);
+        for (i = 0; i < sizeof(noice_prefix)/sizeof(char*); i++) {
+            if (strncmp(noice_prefix[i], api->func_name, strlen(noice_prefix[i])) == 0) {
+                break;
+            }
+        }
+        if (i < sizeof(noice_prefix)/sizeof(char*)) {
+            continue;
+        }
         if (api->so_name) {
-            fprintf(fp, "   host_file: %s\n", api->so_name);
+            for (i = 0; i < sizeof(noice_lib)/sizeof(char*); i++) {
+                if (strncmp(noice_lib[i], api->so_name, strlen(noice_lib[i])) == 0) {
+                break;
+                }
+            }
+            if (i < sizeof(noice_prefix)/sizeof(char*)) {
+                continue;
+            }
+            fprintf(fp, "%s %lx %s\n", api->so_name, api->offset, api->func_name);
+        } else {
+            fprintf(fp, "self %s %lx\n", api->func_name, api->offset);
         }
     }
     fclose(fp);

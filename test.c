@@ -20,7 +20,7 @@ int main ()
 {
     int cnt = 0;
 
-    printf("Run: ./spy -p %d -g -o func_info.txt\n", getpid());
+    printf("Run: ./spy -p %d -g\n", getpid());
     for (;;) {
         cnt+= bar();
     }

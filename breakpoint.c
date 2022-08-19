@@ -62,39 +62,6 @@ struct breakpoint_info_* get_breakpoint_via_addr (pid_t pid, long addr)
     return bp;
 }
 
-/* key is api_name, so make sure API name is global (multi processes) unique */
-void configure_breakpoint (pid_t pid, struct breakpoint_info_ *bp)
-{
-    struct breakpoint_info_* new_bp, *prev_bp;
-    long host_so_base, addr;
-
-    host_so_base = soname_to_addr(pid, bp->host_file);
-    addr = host_so_base + bp->host_offset;
-    if (get_breakpoint_via_addr(pid, addr)) {
-        return;
-    }
-
-    prev_bp = get_breakpoint_via_addr(pid, host_so_base + bp->host_offset);
-    if (prev_bp) {
-        printf("Error: duplicate breakpoints %s and %s\n", bp->func_name, prev_bp->func_name);
-        assert(0);
-    }
-    new_bp = calloc(1, sizeof(struct breakpoint_info_));
-    new_bp->func_name = strdup(bp->func_name);
-    new_bp->func_size = bp->func_size;
-    new_bp->sys_addr.tid = pid;
-    new_bp->sys_addr.addr = host_so_base + bp->host_offset;
-    new_bp->debug_flag = bp->debug_flag;
-    new_bp->host_file = bp->host_file?strdup(bp->host_file):NULL;
-    new_bp->host_offset = bp->host_offset;
-    /* Note, the macro will use get func_name[0] address, donot use func_name */
-    HASH_ADD(api_name_hdl, api_name_set, func_name[0], strlen(bp->func_name), new_bp);
-    HASH_ADD(sys_addr_hdl, sys_addr_set, sys_addr, sizeof(struct addr_key_), new_bp);
-    if (bp->debug_flag) {
-        request_pending_breakpoint(bp->func_name, bp->debug_flag);
-    }
-}
-
 /* really enable the breakpoint */
 int set_breakpoint (pid_t tid, long addr)
 {
@@ -114,24 +81,6 @@ int set_breakpoint (pid_t tid, long addr)
     return 0;
 }
 
-/* Request to enable this breakpoint when this debugger can (attached/stopped) */
-int request_pending_breakpoint (char *name, int debug_flag)
-{
-    struct breakpoint_info_* bp;
-
-    if (name[0] == '#') {
-        return -1;
-    }
-    HASH_FIND(api_name_hdl, api_name_set, name, strlen(name), bp);
-    if (!bp) {
-        //printf("Error: API %s not configured, skip\n", name);
-        return -1;
-    }
-    bp->debug_flag = debug_flag;
-    HASH_ADD(pending_hdl, pending_set, func_name[0], strlen(name), bp);
-    return 0;
-}
-
 int enable_pending_breakpoints (struct traced_process_ *proc)
 {
     struct breakpoint_info_ *bp, *tmp;
@@ -143,12 +92,9 @@ int enable_pending_breakpoints (struct traced_process_ *proc)
         data = bp->orig_code;
         memcpy((void *)&data, break_instr, sizeof(break_instr));
         if (ptrace(PTRACE_POKETEXT, bp->sys_addr.tid, bp->sys_addr.addr, data) < 0) {
-            printf("Warning: fail to break %s, skipped\n", bp->func_name);
+            printf("Warning: fail to break API: %s(%lx) so: %s, addr: (%lx) skipped\n",
+                     bp->api_name, bp->api_offset, bp->so_name, bp->sys_addr.addr);
             continue;
-        }
-        if (bp->debug_flag == 0) {
-            /* from extra added breakpoint file */
-            bp->debug_flag = 1;
         }
         inserted_cnt++;
     }
@@ -184,10 +130,10 @@ void disable_all_breakpoints (pid_t target_pid)
         }
         if (ptrace(PTRACE_POKETEXT,
                    bp->sys_addr.tid, bp->sys_addr.addr, bp->orig_code) < 0) {
-            printf("Restore breakpoint %s failed\n", bp->func_name);
+            printf("Restore breakpoint %s failed\n", bp->api_name);
         }
         if (debug_bp_verbose) {
-            printf("Disable %s %d %lx\n", bp->func_name, bp->sys_addr.tid, bp->sys_addr.addr);
+            printf("Disable %s %d %lx\n", bp->api_name, bp->sys_addr.tid, bp->sys_addr.addr);
         }
         cnt++;
     }
@@ -228,11 +174,11 @@ void print_callinfo (struct traced_process_ *proc, struct breakpoint_info_ *acti
     if (is_return == false && (active_bp->debug_flag & SHOW_BACKTRACE)) {
         display_backtrace(tid, depth, &trace_ip[0]);
     }
-    if (strncmp(active_bp->func_name, "__be_", strlen("__be_")) == 0) {
+    if (strncmp(active_bp->api_name, "__be_", strlen("__be_")) == 0) {
         i = strlen("__be_");
     }
     j = is_return?1:0;
-    output_message("[%d]%*s%s%s\n", depth + j, depth*4, " ", is_return?"    <-":"->", &active_bp->func_name[i]);
+    output_message("[%d]%*s%s%s\n", depth + j, depth*4, " ", is_return?"    <-":"->", &active_bp->api_name[i]);
 }
 
 void run_shadow_api (int pid, long shadow_abs_addr, struct user_regs_struct *regs)
@@ -288,7 +234,7 @@ int insert_breakpoint_for_return (struct breakpoint_info_ *func_bp,
     }
     ret_bp = calloc(1, sizeof(struct breakpoint_info_));
     assert(ret_bp);
-    ret_bp->func_name = strdup(func_bp->func_name);
+    ret_bp->api_name = strdup(func_bp->api_name);
     ret_bp->sys_addr.addr = return_addr;
     ret_bp->sys_addr.tid = tid;
     ret_bp->orig_code = ptrace(PTRACE_PEEKTEXT, tid, return_addr, 0);
@@ -304,7 +250,7 @@ int insert_breakpoint_for_return (struct breakpoint_info_ *func_bp,
     if (debug_bp_verbose) {
         printf("%s:%d:%s, inserted breakpoint for %s return @ %lx\n",
                __FILE__, __LINE__, __FUNCTION__,
-               func_bp->func_name, return_addr);
+               func_bp->api_name, return_addr);
     }
     HASH_ADD(sys_addr_hdl, sys_addr_set, sys_addr, sizeof(struct addr_key_), ret_bp);
     return 0;
@@ -334,7 +280,7 @@ int step_over_lwp (struct traced_process_ *proc, pid_t tid)
         api_hook[i](tid, bp, &regs);
     }
     if (bp->is_return == false
-            && ((bp->debug_flag & SHOW_FLOW) == 0)) {
+            && ((bp->debug_flag & BREAK_ON_RETURN) == 0)) {
         insert_breakpoint_for_return(bp, proc->tgid, &regs);
     }
     if (ptrace(PTRACE_POKETEXT, proc->tgid, bp->sys_addr.addr, bp->orig_code) < 0) {
@@ -352,15 +298,6 @@ int step_over_lwp (struct traced_process_ *proc, pid_t tid)
         return -1;
     }
     waitpid(tid, &status, __WALL);
-    if (bp->debug_flag & SHOW_FLOW) {
-        long return_addr;
-
-        return_addr = ptrace(PTRACE_PEEKTEXT, tid, regs.rsp, 0);
-        examine_api(tid, return_addr,
-                    bp->sys_addr.addr,
-                    bp->sys_addr.addr + bp->sys_addr.addr + bp->func_size);
-    }
-
     if (bp->is_return == false) {
         set_breakpoint(proc->tgid, addr);
     } else {
@@ -386,30 +323,6 @@ static char *trim (char *str)
     return p;
 }
 
-void load_breakpoint_set (pid_t pid, const char *bp_file)
-{
-    char *line = NULL, *api_name;
-    size_t nread, len;
-    int cnt = 0;
-    FILE *bfp;
-
-    printf("Loading extra watch API list from %s for pid %d\n", bp_file, pid);
-    bfp = fopen(bp_file, "r");
-    if (bfp) {
-        while ((nread = getline(&line, &len, bfp)) != -1) {
-            api_name = trim(line);
-            if (request_pending_breakpoint(api_name, 1) == 0) {
-                cnt++;
-            }
-            if (cnt%100 == 0) {
-                printf("!");
-            }
-        }
-        free(line);
-        fclose(bfp);
-        printf("\nIn total requesting %d breakpoints\n", cnt);
-    }
-}
 
 int breakpoint_main_loop (pid_t target_pid)
 {
@@ -446,4 +359,117 @@ int breakpoint_main_loop (pid_t target_pid)
 void breakpoint_exit_loop (void)
 {
     exit_flag = true;
+}
+
+int load_active_breakpoints (FILE *bfp, pid_t pid)
+{
+    size_t nread, len;
+    int rc, cnt = 0, debug_flag;
+    struct breakpoint_info_ *bp;
+    char *line = NULL, *breakpoint_info, api_name[MAX_INFO_LEN], debug_flag_str[MAX_INFO_LEN];
+
+    while ((nread = getline(&line, &len, bfp)) != -1) {
+        breakpoint_info = trim(line);
+
+        memset(api_name, 0, sizeof(api_name));
+        memset(debug_flag_str, 0, sizeof(debug_flag_str));
+        rc = sscanf(breakpoint_info, "%s %s\n", api_name, debug_flag_str);
+
+        debug_flag = 1;
+        if (rc > 1) {
+            debug_flag = strtoul(debug_flag_str, NULL, 10);
+        }
+        if (debug_flag < 1 || rc < 1) {
+            printf("Warning: ignore invalid breakpoint %s,\nexpect: <api_name> [debug_flag]\n", line);
+            continue;
+        }
+
+        HASH_FIND(api_name_hdl, api_name_set, api_name, strlen(api_name), bp);
+        if (bp) {
+            cnt++;
+        } else {
+            printf("Error: skip unknown API %s\n", api_name);
+        }
+        bp->debug_flag = debug_flag;
+        HASH_ADD(pending_hdl, pending_set, api_name[0], strlen(api_name), bp);
+#if 0
+        printf("Loaded api (%s,%lx@%s) at %lx\n", 
+                bp->api_name, bp->api_offset,
+                bp->so_name?bp->so_name:"self",
+                bp->sys_addr.addr);
+#endif
+        if (cnt%100 == 0) {
+            printf("!");
+        }
+    }
+    free(line);
+    fclose(bfp);
+
+    printf("\nIn total requesting %d breakpoints\n", cnt);
+    if (cnt == 0) {
+        printf("Error: no breakpoint defined\n");
+        return -1;
+    }
+    return 0;
+}
+
+/* key is api_name, so make sure API name is global (multi processes) unique */
+static void add_api_info (pid_t pid, char *so_name, long api_offset, char *api_name)
+{
+    struct breakpoint_info_* new_bp, *prev_bp;
+    long so_baseaddr, addr;
+
+    so_baseaddr = soname_to_addr(pid, so_name);
+    if (so_baseaddr == 0) {
+        printf("Warning: fail to locate %s@%s\n", api_name, so_name?so_name:"self");
+        return;
+    }
+    addr = so_baseaddr + api_offset;
+    if (get_breakpoint_via_addr(pid, addr)) {
+        return;
+    }
+    prev_bp = get_breakpoint_via_addr(pid, so_baseaddr + api_offset);
+    if (prev_bp) {
+        printf("Error: duplicate breakpoints %s and %s\n", api_name, prev_bp->api_name);
+        assert(0);
+    }
+
+    new_bp = calloc(1, sizeof(struct breakpoint_info_));
+    new_bp->api_name = strdup(api_name);
+    new_bp->api_offset = api_offset;
+
+    new_bp->sys_addr.tid = pid;
+    new_bp->sys_addr.addr = so_baseaddr + api_offset;
+
+    /* Note, the macro will use get api_name[0] address, donot use api_name */
+    HASH_ADD(api_name_hdl, api_name_set, api_name[0], strlen(api_name), new_bp);
+    HASH_ADD(sys_addr_hdl, sys_addr_set, sys_addr, sizeof(struct addr_key_), new_bp);
+
+    //printf("API (%s): %s:%lx, real addr %lx\n", api_name, so_name, api_offset, new_bp->sys_addr.addr);
+}
+
+void load_api_addr_info (FILE *fp, pid_t pid)
+{
+    size_t nread, len;
+    char *line = NULL, *api_info;
+    char offset_buf[MAX_INFO_LEN], api_name[MAX_INFO_LEN], so_name[MAX_INFO_LEN];
+
+    while ((nread = getline(&line, &len, fp)) != -1) {
+        api_info = trim(line);
+        if (api_info[0] == '#') {
+            continue;
+        }
+        memset(offset_buf, 0, sizeof(offset_buf));
+        memset(api_name, 0, sizeof(api_name));
+        memset(so_name, 0, sizeof(api_name));
+        sscanf(api_info, "%s %s %s\n", so_name, api_name, offset_buf);
+
+        if (strncmp(so_name, "self", strlen("self")) == 0) {
+            add_api_info(pid, NULL, strtoul(offset_buf, NULL, 16), api_name);
+        } else {
+            add_api_info(pid, so_name, strtoul(offset_buf, NULL, 16), api_name);
+        }
+    }
+
+    free(line);
 }
