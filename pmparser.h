@@ -64,7 +64,7 @@ typedef struct procmaps_iterator {
  * @param pid the process id whose memory map to be parser. the current process if pid<0
  * @return an iterator over all the nodes
  */
-procmaps_iterator* pmparser_parse(int pid);
+procmaps_iterator* pmparser_parse(int pid, int *cnt);
 
 /**
  * pmparser_next
@@ -92,9 +92,5 @@ void _pmparser_split_line(char*buf,char*addr1,char*addr2,char*perm, char* offset
  * @order the order of the area to print, -1 to print everything
  */
 void pmparser_print(procmaps_struct* map,int order);
-
-
-
-
 
 #endif

@@ -20,7 +20,7 @@ implied warranty.
 //procmaps_struct* g_current=NULL;
 
 
-procmaps_iterator* pmparser_parse(int pid)
+procmaps_iterator* pmparser_parse(int pid, int* vm_cnt)
 {
     FILE *file;
     int ind=0;
@@ -89,7 +89,9 @@ procmaps_iterator* pmparser_parse(int pid)
     //close file
     fclose(file);
 
-
+    if (vm_cnt) {
+        *vm_cnt = ind;
+    }
     //g_last_head=list_maps;
     maps_it->head = list_maps;
     maps_it->current =  list_maps;

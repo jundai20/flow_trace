@@ -11,72 +11,11 @@
 #include <elf.h>
 #include <sys/mman.h>
 #include <limits.h>
+#include <libgen.h>
 
 #include "pmparser.h"
 
-#define MAX_PATH_LEN 256
-
-struct share_mem_zone_ {
-    struct share_mem_zone_ *next;
-
-    char *name;
-    long addr_start;
-    long addr_end;
-};
-
-typedef struct api_addr_info_ {
-    char *so_name;
-    char *func_name;
-
-    long offset;
-    long addr_start;
-    long addr_end;
-
-
-    UT_hash_handle hh;
-} api_addr_info_t;
-
-struct lib_name_ {
-    char *name;
-    long base_addr;
-
-    UT_hash_handle hh;
-};
-
-struct proc_addr_info_ {
-    /* Key is pid */
-    pid_t pid;
-
-    char *self_name;
-    char *full_name;
-    long addr_start, addr_end;
-    long exe_start, exe_end;
-
-    bool sym_loaded;
-
-    /* Duplicate name not supported to simplify logic */
-    struct api_addr_info_ *api_set;
-    struct lib_name_ *lib_set;
-    struct share_mem_zone_ *shmem_hdr;
-
-    struct so_load_info_ *vm_zone;
-    char *trace_key;
-
-    UT_hash_handle hh;
-};
-
 static struct proc_addr_info_ *proc_addr_set;
-
-static char* app_base_name (char const *path)
-{
-    char *s = strrchr(path, '/');
-
-    if (s) {
-        return strdup((const char*)s+1);
-    } else {
-        return strdup((const char*)path);
-    }
-}
 
 static char* pid_to_exec_file (int pid)
 {
@@ -107,76 +46,100 @@ static char* file_base_name (char const *path)
     }
 }
 
+static void append_vm_info (struct proc_addr_info_ *proc, procmaps_struct *cur_map)
+{
+    struct vm_zone_ *vm_info, *tmp_vm = proc->vm_hdr;
+
+    vm_info = calloc(1, sizeof(struct vm_zone_));
+    assert(vm_info);
+    vm_info->path = strdup(cur_map->pathname);
+    assert(vm_info->path);
+    vm_info->addr_start = (long)cur_map->addr_start;
+    vm_info->addr_end = (long)cur_map->addr_end;
+    if (cur_map->is_r) {
+        vm_info->p_flags |= 0x04;
+    }
+    if (cur_map->is_w) {
+        vm_info->p_flags |= 0x02;
+    }
+    if (cur_map->is_x) {
+        vm_info->p_flags |= 0x01;
+    }
+
+    if (tmp_vm) {
+        while (tmp_vm->next) {
+            tmp_vm = tmp_vm->next;
+        }
+        tmp_vm->next = vm_info;
+    } else {
+        proc->vm_hdr = vm_info;
+    }
+}
+
+static void append_so_info (struct proc_addr_info_ *proc, procmaps_struct *cur_map)
+{
+    so_load_info *so_info, *prev_info;
+    struct proc_so_ *lib;
+    char *so_name = file_base_name(cur_map->pathname);
+
+    HASH_FIND_STR(proc->vm_zone, so_name, prev_info);
+    if (prev_info) {
+        return;
+    }
+
+    so_info = calloc(1, sizeof(so_load_info));
+    assert(so_info);
+    so_info->addr_start = (long)cur_map->addr_start;
+    so_info->addr_end = (long)cur_map->addr_end;
+    so_info->so_name = so_name;
+    so_info->full_path = strdup(cur_map->pathname);
+    //printf("VM area %s\n    %lx-%lx, perm = %s\n", so_info->full_path, so_info->addr_start, so_info->addr_end, cur_map->perm);
+    HASH_ADD_STR(proc->vm_zone, so_name, so_info);
+    if (strstr(so_name, ".so")
+            && strncmp("ld-", so_name, strlen("ld-"))
+            && strncmp("linux-vdso", so_name, strlen("linux-vdso"))) {
+        HASH_FIND_STR(proc->lib_set, cur_map->pathname, lib);
+        if (!lib) {
+            lib = malloc(sizeof(struct proc_so_));
+            lib->full_path = strdup(cur_map->pathname);
+            lib->proc_basename = basename(lib->full_path);
+            lib->base_addr = so_info->addr_start;
+            HASH_ADD_STR(proc->lib_set, proc_basename, lib);
+        }
+    }
+}
+
+static void save_self_exe_offset (struct proc_addr_info_ *proc, procmaps_struct *cur_map)
+{
+    char *so_name = file_base_name(cur_map->pathname);
+
+    if (strncmp(proc->self_name, so_name, strlen(proc->self_name)) == 0) {
+        if (proc->addr_start == 0) {
+            proc->addr_start = (long)cur_map->addr_start;
+            proc->addr_end = (long)cur_map->addr_end;
+        }
+        if (proc->exe_start == 0 && cur_map->is_x) {
+            proc->exe_start = (long)cur_map->addr_start;
+            proc->exe_end = (long)cur_map->addr_end;
+        }
+    }
+}
 
 static int read_memory_regions (struct proc_addr_info_ *proc)
 {
     procmaps_iterator* maps;
-    so_load_info *vm_info, *prev_info;
     procmaps_struct *cur_map;
-    char *so_name;
-    struct lib_name_ *lib;
 
     proc->full_name = pid_to_exec_file(proc->pid);
-    proc->self_name = app_base_name(proc->full_name);
+    proc->self_name = basename(proc->full_name);
 
-    maps  = pmparser_parse(proc->pid);
+    maps  = pmparser_parse(proc->pid, &proc->vm_cnt);
     assert(maps);
     while( (cur_map = pmparser_next(maps)) != NULL) {
         //pmparser_print(cur_map, 0);
-        so_name = file_base_name(cur_map->pathname);
-        HASH_FIND_STR(proc->vm_zone, so_name, prev_info);
-        if (strncmp(proc->self_name, so_name, strlen(proc->self_name)) == 0) {
-            if (proc->addr_start == 0) {
-                proc->addr_start = (long)cur_map->addr_start;
-                proc->addr_end = (long)cur_map->addr_end;
-            }
-            if (proc->exe_start == 0 && cur_map->is_x) {
-                proc->exe_start = (long)cur_map->addr_start;
-                proc->exe_end = (long)cur_map->addr_end;
-            }
-        }
-        if (prev_info) {
-            /* Seems self can have dup copy (why?), only need to hook the first one ??? */
-            //printf("Duplicate so [%s] skipped\n", so_name);
-            continue;
-        }
-        if (cur_map->is_s) {
-            struct share_mem_zone_ *shm, *tmp = proc->shmem_hdr;
-
-            shm = calloc(1, sizeof(struct share_mem_zone_));
-            shm->addr_start = (long)cur_map->addr_start;
-            shm->addr_end = (long)cur_map->addr_start;
-            shm->name = strdup(so_name);
-            if (tmp) {
-                while (tmp->next) {
-                    tmp = tmp->next;
-                }
-                tmp->next = shm;
-            } else {
-                proc->shmem_hdr = shm;
-            }
-        }
-
-        vm_info = calloc(1, sizeof(so_load_info));
-        assert(vm_info);
-        vm_info->addr_start = (long)cur_map->addr_start;
-        vm_info->addr_end = (long)cur_map->addr_end;
-        vm_info->so_name = so_name;
-        vm_info->full_path = strdup(cur_map->pathname);
-        //printf("VM area %s\n    %lx-%lx, perm = %s\n", vm_info->full_path, vm_info->addr_start, vm_info->addr_end, cur_map->perm);
-        HASH_ADD_STR(proc->vm_zone, so_name, vm_info);
-
-        if (strstr(so_name, ".so")
-                && strncmp("ld-linux", so_name, strlen("ld-linux"))
-                && strncmp("linux-vdso", so_name, strlen("linux-vdso"))) {
-            HASH_FIND_STR(proc->lib_set, cur_map->pathname, lib);
-            if (!lib) {
-                lib = malloc(sizeof(struct lib_name_));
-                lib->name = strdup(cur_map->pathname);
-                lib->base_addr = vm_info->addr_start;
-                HASH_ADD_STR(proc->lib_set, name, lib);
-            }
-        }
+        save_self_exe_offset(proc, cur_map);
+        append_so_info(proc, cur_map);
+        append_vm_info(proc, cur_map);
     }
     pmparser_free(maps);
 
@@ -281,27 +244,9 @@ bool addr_in_range (pid_t pid, long addr)
     proc = get_proc_addrinfo(pid);
     assert(proc);
     if (addr < proc->exe_start || addr > proc->exe_end) {
-        printf("addr [%lx] not in scope %lx - %lx\n", addr, proc->exe_start, proc->exe_end);
+        //printf("addr [%lx] not in scope %lx - %lx\n", addr, proc->exe_start, proc->exe_end);
     }
     return ((addr > proc->exe_start) && (addr < proc->exe_end));
-}
-
-bool addr_is_share_mem (pid_t pid, long addr)
-{
-    struct proc_addr_info_ *proc;
-    struct share_mem_zone_ *shm;
-
-    proc = get_proc_addrinfo(pid);
-    assert(proc);
-    shm = proc->shmem_hdr;
-    while (shm) {
-        if (addr > shm->addr_start && addr < shm->addr_end) {
-            return true;
-        }
-        shm = shm->next;
-    }
-
-    return false;
 }
 
 long soname_to_addr (pid_t pid, const char *target_so)
@@ -314,7 +259,7 @@ long soname_to_addr (pid_t pid, const char *target_so)
     }
     proc = get_proc_addrinfo(pid);
     assert(proc);
-    if (!target_so) {
+    if (!target_so || strncmp(target_so, "self", strlen("self")) == 0) {
         return self_base_addr(pid);
     }
     HASH_FIND_STR(proc->vm_zone, target_so, cur_lib);
@@ -337,100 +282,6 @@ struct so_load_info_* get_so_info (pid_t pid, const char *so_name)
     return cur_lib;
 }
 
-static so_load_info* get_dllib (struct proc_addr_info_ *proc)
-{
-    so_load_info *cur_lib, *tmp;
-
-    assert(proc);
-    HASH_ITER(hh, proc->vm_zone, cur_lib, tmp) {
-        //printf("get_dllib, checking %s...\n", cur_lib->so_name);
-        if (strstr(cur_lib->so_name, "libdl.so") || strstr(cur_lib->so_name, "libdl-")) {
-            //printf("get_dllib loaded at [%lx - %lx]\n", cur_lib->addr_start,cur_lib->addr_end);
-            return cur_lib;
-        }
-    }
-
-    return NULL;
-}
-
-long get_api_offset (char *so_path, char *func_name)
-{
-    FILE *fp;
-    char dl_line_cmd[PATH_MAX];
-    char dl_line[PATH_MAX];
-    char dummy[PATH_MAX];
-    long offset;
-
-    sprintf(dl_line_cmd, "readelf -s %s | grep %s", so_path, func_name);
-    //printf("get_api_offset, execute: [%s] for %s\n", dl_line_cmd, func_name);
-    fp = popen(dl_line_cmd, "r");
-    if (!fp) {
-        printf("Fail to read %s\n", so_path);
-        return 0;
-    }
-    if (fgets(dl_line, sizeof(dl_line), fp) == NULL) {
-        return 0;
-    }
-    pclose(fp);
-
-    sscanf(dl_line, "%s %lx", dummy, &offset);
-    return offset;
-}
-
-void iterator_library (pid_t pid, so_iter_fn fn, void *ctx)
-{
-    struct proc_addr_info_ *proc;
-    so_load_info *cur_lib, *tmp;
-
-    proc = get_proc_addrinfo(pid);
-    assert(proc);
-    HASH_ITER(hh, proc->vm_zone, cur_lib, tmp) {
-        fn(cur_lib, ctx);
-    }
-}
-
-long get_dlopen_addr (pid_t pid)
-{
-    so_load_info *dlso;
-    long offset;
-    struct proc_addr_info_ *proc;
-
-    proc = get_proc_addrinfo(pid);
-    assert(proc);
-    dlso = get_dllib(proc);
-    if (!dlso) {
-        return 0;
-    }
-    //printf("get_dlopen_addr, dl libraray loaded [%lx - %lx] \n", dlso->addr_start, dlso->addr_end);
-    offset = get_api_offset(dlso->full_path, "dlopen");
-    if (!offset) {
-        return 0;
-    }
-
-    return offset + dlso->addr_start;
-}
-
-long get_dlsym_addr (pid_t pid)
-{
-    so_load_info *dlso;
-    struct proc_addr_info_ *proc;
-    long offset;
-
-    proc = get_proc_addrinfo(pid);
-    assert(proc);
-    dlso = get_dllib(proc);
-    if (!dlso) {
-        return 0;
-    }
-    //printf("get_dlsym_addr, dl libraray loaded [%lx - %lx] \n", dlso->addr_start, dlso->addr_end);
-    offset = get_api_offset(dlso->full_path, "dlsym");
-    if (!offset) {
-        return 0;
-    }
-
-    return offset + dlso->addr_start;
-}
-
 void display_backtrace (pid_t pid, int cnt, long *bt)
 {
     int i;
@@ -438,6 +289,9 @@ void display_backtrace (pid_t pid, int cnt, long *bt)
     struct proc_addr_info_ *proc;
 
     HASH_FIND_INT(proc_addr_set, &pid, proc);
+    if (!proc) {
+        return;
+    }
     printf("%*s%s", cnt*2, " ", proc->trace_key?proc->trace_key:"backtrace: ");
     for (i = 0; i < cnt; i++) {
         lib = get_addr_lib(pid, bt[i]);
@@ -472,18 +326,27 @@ struct handle {
     struct elf64 *elf64;
 };
 
-static void save_symbol (struct proc_addr_info_ *proc, char *func_name,
-                         struct lib_name_ *lib, Elf64_Sym  *symtab64, bool self)
+/* Store api address information into process global api_set table, lib used to provide addr info */
+static void save_symbol (struct proc_addr_info_ *proc, char *api_name,
+                         struct proc_so_ *lib, Elf64_Sym  *symtab64, bool self)
 {
     struct api_addr_info_ *api;
 
     if (symtab64->st_value == 0) {
         return;
     }
-
     api = malloc(sizeof(struct api_addr_info_));
-    api->so_name = self?NULL:app_base_name(lib->name);
-    api->func_name = strdup(func_name);
+    if (self) {
+        api->so_name = strdup("self");
+        api->func_name = strdup(api_name);
+    } else {
+        api->so_name = basename(lib->full_path);
+    }
+    api->func_name = malloc(strlen(api->so_name) + 1 + strlen(api_name) + 1);
+    strcpy(api->func_name, api->so_name);
+    strcat(api->func_name, ":");
+    strcat(api->func_name, api_name);
+
     api->addr_start = lib->base_addr + symtab64->st_value;
     api->addr_end = api->addr_start + symtab64->st_size;
     api->offset = symtab64->st_value;
@@ -521,7 +384,7 @@ static int map_elf64 (struct proc_addr_info_ *proc, size_t *len, struct handle *
     return 0;
 }
 
-static int parse_symbols (struct proc_addr_info_ *proc, struct lib_name_ *lib, struct handle *h, bool self)
+static int parse_symbols (struct proc_addr_info_ *proc, struct proc_so_ *lib, struct handle *h, bool self)
 {
     unsigned int i, j;
     char *SymStrTable;
@@ -539,8 +402,9 @@ static int parse_symbols (struct proc_addr_info_ *proc, struct lib_name_ *lib, s
             symtab64 = (Elf64_Sym *)&h->map[shdr64[i].sh_offset];
             for (j = 0; j < shdr64[i].sh_size / sizeof(Elf64_Sym); j++, symtab64++) {
                 st_type = ELF64_ST_TYPE(symtab64->st_info);
-                if (st_type != STT_FUNC && st_type != STT_OBJECT)
+                if (st_type != STT_FUNC) {
                     continue;
+                }
                 switch(shdr64[i].sh_type) {
                 case SHT_SYMTAB:
                     name = &SymStrTable[symtab64->st_name];
@@ -558,16 +422,16 @@ static int parse_symbols (struct proc_addr_info_ *proc, struct lib_name_ *lib, s
     return 0;
 }
 
-static int read_elf_symbols (struct proc_addr_info_ *proc, struct lib_name_ *lib, bool self)
+/* Parse a library or application itself, store API information to lib */
+static int read_elf_symbols (struct proc_addr_info_ *proc, struct proc_so_ *lib, bool self)
 {
     struct handle elf_info;
     size_t len;
-    char *file_name = lib->name;
+    char *file_name = lib->full_path;
 
     memset(&elf_info, 0, sizeof(elf_info));
     elf_info.elf64 = malloc(sizeof(struct elf64));
     elf_info.path = file_name;
-
     if (map_elf64(proc, &len, &elf_info)) {
         printf("Error: can not map %s to elf64\n", file_name);
         return -1;
@@ -582,12 +446,12 @@ static int read_elf_symbols (struct proc_addr_info_ *proc, struct lib_name_ *lib
 /* It is expensive */
 static void read_application_symbols (pid_t pid)
 {
-    struct lib_name_ *lib, *tmp, dummy_lib;
+    struct proc_so_ *lib, *tmp, dummy_lib;
     struct proc_addr_info_ *proc;
 
     proc = get_proc_addrinfo(pid);
-    memset(&dummy_lib, 0, sizeof(struct lib_name_));
-    dummy_lib.name = proc->full_name;
+    memset(&dummy_lib, 0, sizeof(struct proc_so_));
+    dummy_lib.full_path = proc->full_name;
     dummy_lib.base_addr = self_base_addr(pid);
     read_elf_symbols(proc, &dummy_lib, true);
 
@@ -596,7 +460,7 @@ static void read_application_symbols (pid_t pid)
     }
 }
 
-int get_api_addr (pid_t pid, const char *api_name, long *addr_start, long* addr_end)
+int get_self_api_addr (pid_t pid, const char *api_name, long *addr_start, long* addr_end)
 {
     struct proc_addr_info_ *proc;
     struct api_addr_info_ *api;
@@ -626,24 +490,53 @@ int get_api_addr (pid_t pid, const char *api_name, long *addr_start, long* addr_
     return 0;
 }
 
+#define MAX_API_FULL_PATH_LEN 128
+
+int get_so_api_addr (pid_t pid, const char *so_name, const char *api_name, long *addr_start)
+{
+    struct proc_addr_info_ *proc;
+    struct proc_so_ *lib;
+    char full_name[MAX_API_FULL_PATH_LEN] = {0};
+    struct api_addr_info_ *api;
+
+    proc = get_proc_addrinfo(pid);
+    if (!proc) {
+        return -1;
+    }
+
+    HASH_FIND_STR(proc->lib_set, so_name, lib);
+    if (!lib) {
+        return -2;
+    }
+
+    if (proc->sym_loaded == false) {
+        read_application_symbols(pid);
+        proc->sym_loaded = true;
+    }
+
+    sprintf(full_name, "%s:%s", so_name, api_name);
+    HASH_FIND_STR(proc->api_set, full_name, api);
+    if (!api) {
+        return -3;
+    }
+
+    *addr_start = api->addr_start;
+    return 0;
+}
+
 const char *noice_prefix[] = {
-     "_",
+    "_",
     "register_tm_clones",
     "deregister_tm_clones",
     "frame_dummy",
     "completed"
 };
 
-const char *noice_lib[] = {
-    "libc-",
-    "ld-"
-};
-
-void generate_func_description (pid_t pid, char *cfg_file)
+void generate_func_description (pid_t pid, const char *info_file, const char *breakpoint_file)
 {
     struct proc_addr_info_ *proc;
     struct api_addr_info_ *api, *tmp;
-    FILE *fp;
+    FILE *info_fp, *bp_fp;
     int i;
 
     read_application_symbols(pid);
@@ -651,10 +544,16 @@ void generate_func_description (pid_t pid, char *cfg_file)
     if (!proc) {
         return;
     }
-    if ((fp = fopen(cfg_file, "w")) == NULL) {
-        printf("Error: can not open %s for write\n", cfg_file);
+
+    if ((bp_fp = fopen(breakpoint_file, "w")) == NULL) {
+        printf("Error: can not open %s for write\n", breakpoint_file);
         return;
     }
+    if ((info_fp = fopen(info_file, "w")) == NULL) {
+        printf("Error: can not open %s for write\n", info_file);
+        return;
+    }
+
     HASH_ITER(hh, proc->api_set, api, tmp) {
         for (i = 0; i < sizeof(noice_prefix)/sizeof(char*); i++) {
             if (strncmp(noice_prefix[i], api->func_name, strlen(noice_prefix[i])) == 0) {
@@ -664,19 +563,13 @@ void generate_func_description (pid_t pid, char *cfg_file)
         if (i < sizeof(noice_prefix)/sizeof(char*)) {
             continue;
         }
-        if (api->so_name) {
-            for (i = 0; i < sizeof(noice_lib)/sizeof(char*); i++) {
-                if (strncmp(noice_lib[i], api->so_name, strlen(noice_lib[i])) == 0) {
-                break;
-                }
-            }
-            if (i < sizeof(noice_prefix)/sizeof(char*)) {
-                continue;
-            }
-            fprintf(fp, "%s %lx %s\n", api->so_name, api->offset, api->func_name);
+        if (strncmp(api->so_name, "self", strlen("self")) == 0) {
+            fprintf(info_fp, "%s %lx\n", api->func_name, api->offset);
+            fprintf(bp_fp, "%s\n", api->func_name);
         } else {
-            fprintf(fp, "self %s %lx\n", api->func_name, api->offset);
+            fprintf(info_fp, "%s %lx\n", api->func_name, api->offset);
         }
     }
-    fclose(fp);
+    fclose(info_fp);
+    fclose(bp_fp);
 }

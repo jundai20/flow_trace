@@ -3,26 +3,14 @@
 #include <stdio.h>
 #include <sys/time.h>
 #include <stdarg.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 static FILE *output_fd;
 
-void output_message_limited (char *format, ...)
-{
-    struct timeval tv;
-    static time_t saved_sec;
-    va_list args;
-
-    gettimeofday(&tv, NULL);
-    if (saved_sec == tv.tv_sec) {
-        return;
-    }
-    saved_sec = tv.tv_sec;
-    va_start(args, format);
-    vfprintf(output_fd, format, args);
-    va_end(args);
-}
-
-void output_message (char *format, ...)
+void output_message (const char *format, ...)
 {
     va_list args;
 
@@ -39,10 +27,9 @@ int log_subsys_init (const char* log_file)
     }
     output_fd = fopen(log_file, "w+");
     if (output_fd) {
+        setbuf(output_fd, NULL);
         return 0;
     }
-
-    printf("Warning: can not open file to save log\n");
     output_fd = stdout;
     return -1;
 }

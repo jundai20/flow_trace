@@ -8,77 +8,92 @@
 #include <stdbool.h>
 #include <sys/user.h>
 
-#include "proc_ptrace.h"
+#include <libunwind.h>
+#include <libunwind-ptrace.h>
 
-#define MAX_DEPTH 16
+#define PLUGIN_NAME "ibut_plugin.so"
 
-#define SHOW_FUNC_NAME 1
+/* If there is a recursive call, the depth will be deep */
+#define MAX_DEPTH 64
+#define MAX_HOOK_FN_LEN 64
+
+#define SHOW_API_NAME 1
 #define SHOW_BACKTRACE 2
-#define BREAK_ON_RETURN 4
+#define GENERATE_CORE 4
+#define INVOKE_USER_HOOK 8
+
 #define MAX_INFO_LEN 128
 
-/*
- * so_name: The path show in /proc/<pid>/maps
- * api_offset: The offset in the library
- *
- * Example:
- *   readelf -s ./victim | grep foo --> 0x1258
- *
- * When execute foo in victim, expect run foo in libmax.so first
- *
- * breakpoints:
- *  - so_name: /home/lnx/mycode/infect/victim
- *    api_offset: 0x1258
- *    api_name: foo
- *  - so_name: ...
- *    ...
- *
- */
+typedef struct api_info_ {
+    char *api_name;
+    long api_offset;
 
-struct addr_key_ {
-    pid_t tid;
-    long addr;
-} __attribute__((packed));
+    UT_hash_handle off_hdl;
+    UT_hash_handle hh;
+} api_info_t;
 
 typedef struct breakpoint_info_ {
-    /* api_name for display purpose, also used as key */
     char *api_name;
-    struct addr_key_ sys_addr;
 
+    long sys_addr;
     long orig_code;
-    /* If this is return, it is dynamic, should be removed automatically when hitten */
     bool is_return;
     int debug_flag;
 
-    /* so_name is so libaray, if not specified, it is self */
-    char *so_name;
-    long api_offset;
+    size_t expected_life;
+    size_t hit_cnt;
 
-    UT_hash_handle sys_addr_hdl;
-    UT_hash_handle api_name_hdl;
-    UT_hash_handle pending_hdl;
+    UT_hash_handle hh ;
 } breakpoint_info_t;
 
-int read_breakpoint_config (const char *cfg_file);
-void relocate_breakpoint_addr (int pid);
-void display_all_breakpoints (void);
+typedef struct pending_breakpoint_ {
+    char *api_name;
+    bool enable;
+    int debug_flag;
 
-int breakpoint_main_loop (int traced);
-void configure_breakpoint (pid_t pid, struct breakpoint_info_ *bp);
-void restore_all_bp (pid_t target_pid);
-struct bp_info_* update_api_address (pid_t pid, const char *api_name);
-struct bp_info_* get_entry_breakpoint (long rip);
-int commit_breakpoint (pid_t tid, long addr);
-int get_tid_cnt (struct traced_process_ *proc);
-struct breakpoint_info_* get_breakpoint_via_addr (pid_t pid, long addr);
-int enable_breakpoint_via_name (char *name);
-int request_pending_breakpoint (char *name, int flag);
-void disable_all_breakpoints (pid_t target_pid);
-int remote_backtrace (struct traced_process_ *proc, int tid, long trace_ip[MAX_DEPTH]);
+    UT_hash_handle hh;
+} pending_breakpoint_t;
+
+typedef enum {
+    RUNNING,
+    TRAPPED,
+    STOPPED
+} thread_state_e;
+
+struct thread_info_ {
+    int tid;
+    thread_state_e state;
+    struct breakpoint_info_ *active_bp;
+
+    UT_hash_handle hh;
+};
+
+typedef enum {
+    WAIT_FOR_BP,
+    WAIT_FOR_STOP,
+    WAIT_FOR_STEP
+} proc_state_e;
+
+struct traced_process_ {
+    /* tgid of this process, AKA main process id */
+    pid_t tgid;
+    struct proc_addr_info_ *addr_info;
+    proc_state_e state;
+    struct thread_info_ *thread_set;
+
+    void *ui;
+    unw_cursor_t unw_c;
+    unw_addr_space_t addr_space;
+
+    /* If this is main, link to global list */
+    UT_hash_handle hh;
+};
+
 void breakpoint_exit_loop (void);
-int load_active_breakpoints (FILE *bfp, pid_t pid);
-void load_api_addr_info (FILE *fp, pid_t pid);
-typedef int (*api_callback_fn)(pid_t tid, struct breakpoint_info_ *bp,
-                               struct user_regs_struct *regs);
-int regist_api_hook (api_callback_fn fn);
+int load_api_addr_info (const char *sym_file, pid_t pid);
+int load_active_breakpoints (const char *breakpoint_file);
+int breakpoint_main_loop (pid_t target_pid);
+void ptrace_getdata (pid_t child, long addr, char *str, int len);
+
+typedef int (*user_hook_fn)(long, long, long, long, long, long);
 #endif
