@@ -43,8 +43,6 @@ def load_one_file_apis (file_path, api_set, proc_info):
         api_set[api_name] = new_api
     print("done.");
 
-#TODO: /ws/judai-sjc/usr/local/bin/pahole ./vob/cisco.comp/BUILD_TREE/_gen_overlord_universalk9-x86_64_cge7/cbs_sub_sched.o.dwp
-
 if __name__ == '__main__':
     parser = ArgumentParser(description='Usage:')
     parser.add_argument('-s', '--target_so', type=str, required=False, help="so library file")
@@ -80,3 +78,4 @@ if __name__ == '__main__':
             print("Generate process info file /tmp/proc_list.txt , it needs a few minutes...")
             for key, value in proc_info.items():
                 fp.write(key + " " + value + "\n")
+    print("Generated /tmp/api_list.txt, can be used with -s api_list.txt")
